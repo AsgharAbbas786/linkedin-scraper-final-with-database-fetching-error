@@ -1,4 +1,52 @@
--- Drop existing policies if they exist
+-- Enable necessary extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Create tables first
+CREATE TABLE IF NOT EXISTS public.users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  auth_user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  username text UNIQUE NOT NULL,
+  email text UNIQUE NOT NULL,
+  full_name text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.apify_keys (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE,
+  key_name text NOT NULL,
+  api_key text NOT NULL,
+  is_active boolean DEFAULT true,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE(user_id, key_name)
+);
+
+CREATE TABLE IF NOT EXISTS public.linkedin_profiles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE,
+  linkedin_url text UNIQUE NOT NULL,
+  profile_data jsonb DEFAULT '{}'::jsonb NOT NULL,
+  last_updated timestamptz DEFAULT now(),
+  created_at timestamptz DEFAULT now(),
+  tags text[] DEFAULT '{}'::text[]
+);
+
+CREATE TABLE IF NOT EXISTS public.scraping_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE,
+  apify_key_id uuid REFERENCES public.apify_keys(id) ON DELETE SET NULL,
+  job_type text NOT NULL CHECK (job_type = ANY (ARRAY['post_comments'::text, 'profile_details'::text, 'mixed'::text])),
+  input_url text NOT NULL,
+  status text DEFAULT 'pending' CHECK (status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text])),
+  results_count integer DEFAULT 0,
+  error_message text,
+  created_at timestamptz DEFAULT now(),
+  completed_at timestamptz
+);
+
+-- Drop existing policies if they exist (now that tables are created)
 DROP POLICY IF EXISTS "Users can read own profile" ON public.users;
 DROP POLICY IF EXISTS "Users can update own profile" ON public.users;
 DROP POLICY IF EXISTS "Users can manage own API keys" ON public.apify_keys;
@@ -14,57 +62,6 @@ DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 -- Drop existing functions if they exist
 DROP FUNCTION IF EXISTS public.handle_new_user();
 DROP FUNCTION IF EXISTS public.get_or_create_user_profile(uuid);
-
--- Enable necessary extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Create users table (linked to auth.users)
-CREATE TABLE IF NOT EXISTS public.users (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  auth_user_id uuid REFERENCES auth.users(id) ON DELETE CASCADE,
-  username text UNIQUE NOT NULL,
-  email text UNIQUE NOT NULL,
-  full_name text,
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
-);
-
--- Create apify_keys table for multiple API keys per user
-CREATE TABLE IF NOT EXISTS public.apify_keys (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE,
-  key_name text NOT NULL,
-  api_key text NOT NULL,
-  is_active boolean DEFAULT true,
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now(),
-  UNIQUE(user_id, key_name)
-);
-
--- Create linkedin_profiles table (shared between users but with ownership tracking)
-CREATE TABLE IF NOT EXISTS public.linkedin_profiles (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE, -- Original scraper
-  linkedin_url text UNIQUE NOT NULL,
-  profile_data jsonb DEFAULT '{}'::jsonb NOT NULL,
-  last_updated timestamptz DEFAULT now(),
-  created_at timestamptz DEFAULT now(),
-  tags text[] DEFAULT '{}'::text[]
-);
-
--- Create scraping_jobs table
-CREATE TABLE IF NOT EXISTS public.scraping_jobs (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid REFERENCES public.users(id) ON DELETE CASCADE,
-  apify_key_id uuid REFERENCES public.apify_keys(id) ON DELETE SET NULL,
-  job_type text NOT NULL CHECK (job_type = ANY (ARRAY['post_comments'::text, 'profile_details'::text, 'mixed'::text])),
-  input_url text NOT NULL,
-  status text DEFAULT 'pending' CHECK (status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text])),
-  results_count integer DEFAULT 0,
-  error_message text,
-  created_at timestamptz DEFAULT now(),
-  completed_at timestamptz
-);
 
 -- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_users_auth_user_id ON public.users(auth_user_id);
