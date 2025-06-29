@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Auth } from './components/Auth';
+import { ClerkProvider, useUser } from '@clerk/clerk-react';
+import { ClerkAuth } from './components/ClerkAuth';
 import { ScrapingForm } from './components/ScrapingForm';
 import { DataTable } from './components/DataTable';
 import { CommentResults } from './components/CommentResults';
@@ -7,7 +8,7 @@ import { ProfileDetailsDisplay } from './components/ProfileDetailsDisplay';
 import { LoadingProgress } from './components/LoadingProgress';
 import { ProfileResultsTable } from './components/ProfileResultsTable';
 import { ApifyKeyManager } from './components/ApifyKeyManager';
-import { UserMenu } from './components/UserMenu';
+import { ClerkUserMenu } from './components/ClerkUserMenu';
 import { UserProfile } from './components/UserProfile';
 import { JobsTable } from './components/JobsTable';
 import { JobProgressModal } from './components/JobProgressModal';
@@ -15,18 +16,17 @@ import { StorageManager } from './components/StorageManager';
 import { createApifyService } from './lib/apify';
 import { exportData } from './utils/export';
 import { 
-  supabase, 
-  getCurrentUser, 
-  getUserProfile, 
+  getUserProfile,
   checkProfileExists, 
   upsertProfile,
   getUserProfiles,
   getAllProfiles,
+  createClerkSupabaseClient,
   type User,
   type ApifyKey,
   type LinkedInProfile,
   type ScrapingJob
-} from './lib/supabase';
+} from './lib/supabase-clerk';
 import { Linkedin, Database, Activity, Key, Clock, Loader2, AlertCircle, HardDrive } from 'lucide-react';
 
 interface CommentData {
@@ -44,14 +44,12 @@ interface CommentData {
   };
 }
 
-function App() {
-  // Auth state
-  const [user, setUser] = useState<any>(null);
-  const [userProfile, setUserProfile] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [authError, setAuthError] = useState<string>('');
+// Main App Component that uses Clerk
+function AppContent() {
+  const { isSignedIn, user, isLoaded } = useUser();
   
   // App state
+  const [userProfile, setUserProfile] = useState<User | null>(null);
   const [profiles, setProfiles] = useState<LinkedInProfile[]>([]);
   const [commentersData, setCommentersData] = useState<CommentData[]>([]);
   const [profileDetails, setProfileDetails] = useState<any[]>([]);
@@ -79,197 +77,64 @@ function App() {
   const [loadingError, setLoadingError] = useState('');
   const [scrapingType, setScrapingType] = useState<'post_comments' | 'profile_details' | 'mixed'>('post_comments');
 
+  // Loading and error states
+  const [isLoading, setIsLoading] = useState(true);
+  const [authError, setAuthError] = useState<string>('');
+
   // Use ref to prevent double initialization
   const initializationRef = useRef(false);
-  const initTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Helper function to check Supabase connection with timeout
-  const checkSupabaseConnection = async (): Promise<boolean> => {
+  // Initialize user profile when Clerk user is loaded
+  useEffect(() => {
+    if (!isLoaded) return;
+    
+    if (isSignedIn && user && !initializationRef.current) {
+      initializationRef.current = true;
+      initializeUserProfile();
+    } else if (!isSignedIn) {
+      // Reset state when user signs out
+      setUserProfile(null);
+      setProfiles([]);
+      setScrapingJobs([]);
+      initializationRef.current = false;
+    }
+    
+    setIsLoading(false);
+  }, [isLoaded, isSignedIn, user]);
+
+  const initializeUserProfile = async () => {
+    if (!user) return;
+    
     try {
-      console.log('🔍 Checking Supabase connection...');
+      console.log('🚀 Initializing user profile for Clerk user:', user.id);
+      setAuthError('');
       
-      // Create a promise that rejects after 10 seconds
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Connection timeout')), 10000);
-      });
-      
-      // Race between the actual request and timeout
-      const connectionPromise = supabase.auth.getSession();
-      
-      const { data, error } = await Promise.race([connectionPromise, timeoutPromise]) as any;
-      
-      if (error) {
-        console.error('❌ Supabase connection error:', error);
-        throw error;
+      // Get or create user profile in Supabase
+      const profile = await getUserProfile(user.id);
+      if (profile) {
+        setUserProfile(profile);
+        await loadUserData(profile.id);
+      } else {
+        console.warn('⚠️ No user profile found');
+        setAuthError('Failed to create user profile. Please try refreshing the page.');
       }
-      
-      console.log('✅ Supabase connection successful');
-      return true;
-      
     } catch (error) {
-      console.error('❌ Supabase connection failed:', error);
-      throw error;
+      console.error('❌ Error initializing user profile:', error);
+      setAuthError('Failed to initialize user profile. Please try again.');
     }
   };
 
-  // Initialize auth listener with improved error handling and timeout
-  useEffect(() => {
-    // Prevent double initialization in React StrictMode
-    if (initializationRef.current) {
-      console.log('⚠️ Skipping duplicate initialization');
-      return;
-    }
-    initializationRef.current = true;
-
-    const initAuth = async () => {
-      try {
-        console.log('🚀 Initializing authentication...');
-        setAuthError('');
-        setIsLoading(true);
-        
-        // Check if Supabase environment variables are configured
-        if (!import.meta.env.VITE_SUPABASE_URL || !import.meta.env.VITE_SUPABASE_ANON_KEY) {
-          throw new Error('Supabase environment variables are not configured. Please check your .env file.');
-        }
-
-        // Validate environment variables format
-        const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-        const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-        
-        if (!supabaseUrl.startsWith('https://') || !supabaseUrl.includes('.supabase.co')) {
-          throw new Error('Invalid Supabase URL format. Please check your VITE_SUPABASE_URL in the .env file.');
-        }
-        
-        if (supabaseKey.length < 100) {
-          throw new Error('Invalid Supabase anonymous key format. Please check your VITE_SUPABASE_ANON_KEY in the .env file.');
-        }
-
-        console.log('✅ Environment variables validated, checking connection...');
-
-        // Check connection with timeout
-        await checkSupabaseConnection();
-
-        // Get current session with timeout
-        console.log('🔍 Getting current session...');
-        
-        const sessionPromise = supabase.auth.getSession();
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Session timeout')), 8000);
-        });
-        
-        const { data: { session }, error: sessionError } = await Promise.race([sessionPromise, timeoutPromise]) as any;
-
-        if (sessionError) {
-          console.error('❌ Session error:', sessionError);
-          throw new Error(`Authentication error: ${sessionError.message}`);
-        }
-
-        if (session?.user) {
-          console.log('✅ User session found, loading profile...');
-          setUser(session.user);
-          
-          try {
-            const profile = await getUserProfile(session.user.id);
-            if (profile) {
-              setUserProfile(profile);
-              await loadUserData(profile.id);
-            } else {
-              console.warn('⚠️ No user profile found, but user is authenticated');
-              setAuthError('User profile not found. Please try signing out and back in.');
-            }
-          } catch (profileError) {
-            console.error('❌ Error loading user profile:', profileError);
-            setAuthError('Failed to load user profile. Please try refreshing the page.');
-          }
-        } else {
-          console.log('ℹ️ No active session found');
-        }
-        
-      } catch (error) {
-        console.error('❌ Auth initialization error:', error);
-        
-        if (error instanceof Error) {
-          if (error.message.includes('Failed to fetch') || error.message.includes('network') || error.message.includes('timeout')) {
-            setAuthError('Network connection failed. Please check your internet connection and try again.');
-          } else if (error.message.includes('environment variables') || error.message.includes('Invalid Supabase')) {
-            setAuthError('Application configuration error. Please ensure your .env file contains valid Supabase credentials.');
-          } else if (error.message.includes('CORS')) {
-            setAuthError('Cross-origin request blocked. Please check your Supabase project settings.');
-          } else {
-            setAuthError(`Authentication failed: ${error.message}`);
-          }
-        } else {
-          setAuthError('An unexpected error occurred during initialization.');
-        }
-      } finally {
-        setIsLoading(false);
-        console.log('🏁 Auth initialization completed');
-        
-        // Clear the timeout since initialization is complete
-        if (initTimeoutRef.current) {
-          clearTimeout(initTimeoutRef.current);
-          initTimeoutRef.current = null;
-        }
-      }
-    };
-
-    // Set a maximum timeout for the entire initialization process
-    initTimeoutRef.current = setTimeout(() => {
-      console.error('❌ Initialization timeout - forcing completion');
-      setIsLoading(false);
-      setAuthError('Application initialization timed out. Please refresh the page.');
-    }, 15000); // 15 second timeout
-
-    initAuth();
-
-    // Set up auth state change listener with error handling
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      try {
-        console.log('🔄 Auth state changed:', event);
-        setAuthError('');
-
-        if (event === 'SIGNED_IN' && session?.user) {
-          setUser(session.user);
-          const profile = await getUserProfile(session.user.id);
-          setUserProfile(profile);
-          if (profile) {
-            await loadUserData(profile.id);
-          }
-        } else if (event === 'SIGNED_OUT') {
-          setUser(null);
-          setUserProfile(null);
-          setProfiles([]);
-          setScrapingJobs([]);
-        } else if (event === 'TOKEN_REFRESHED') {
-          console.log('🔄 Token refreshed successfully');
-        }
-      } catch (error) {
-        console.error('❌ Auth state change error:', error);
-        setAuthError('Authentication state change failed. Please refresh the page.');
-      }
-    });
-
-    return () => {
-      subscription.unsubscribe();
-      initializationRef.current = false;
-      if (initTimeoutRef.current) {
-        clearTimeout(initTimeoutRef.current);
-      }
-    };
-  }, []); // Empty dependency array to run only once
-
-  // Performance optimization: Load only user's profiles initially
+  // Load user data
   const loadUserData = async (userId: string) => {
     try {
       console.log('🔍 Loading user data for:', userId);
       
-      // Load user's profiles and jobs initially (not all profiles)
       const [userProfilesData, jobs] = await Promise.all([
-        getUserProfiles(userId), // Only fetch user's profiles for faster initial load
+        getUserProfiles(userId),
         loadScrapingJobs(userId)
       ]);
       
-      setProfiles(userProfilesData); // Set to user's profiles only
+      setProfiles(userProfilesData);
       setScrapingJobs(jobs);
       
       console.log(`✅ Loaded ${userProfilesData.length} profiles and ${jobs.length} jobs`);
@@ -282,6 +147,8 @@ function App() {
   const loadScrapingJobs = async (userId: string): Promise<ScrapingJob[]> => {
     try {
       console.log('🔍 Loading scraping jobs for user:', userId);
+      const supabase = createClerkSupabaseClient();
+      
       const { data, error } = await supabase
         .from('scraping_jobs')
         .select('*')
@@ -302,6 +169,48 @@ function App() {
     }
   };
 
+  // Show loading screen while Clerk is initializing
+  if (!isLoaded || isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+          <div className="text-gray-600 text-lg font-medium">Loading Application...</div>
+          <div className="text-gray-500 text-sm mt-2">Connecting to services...</div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show auth screen if not signed in
+  if (!isSignedIn) {
+    return <ClerkAuth />;
+  }
+
+  // Show error if user profile couldn't be loaded
+  if (authError && !userProfile) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-lg border border-gray-100 p-8 text-center">
+          <div className="p-3 bg-red-100 rounded-full w-16 h-16 mx-auto mb-6 flex items-center justify-center">
+            <AlertCircle className="w-8 h-8 text-red-600" />
+          </div>
+          
+          <h2 className="text-xl font-bold text-gray-900 mb-4">Profile Error</h2>
+          <p className="text-gray-600 mb-6">{authError}</p>
+          
+          <button
+            onClick={() => window.location.reload()}
+            className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            Refresh Page
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Rest of your existing component logic...
   const updateLoadingProgress = (stage: typeof loadingStage, progress: number = 0, message: string = '') => {
     setLoadingStage(stage);
     setLoadingProgress(progress);
@@ -317,6 +226,7 @@ function App() {
     if (!userProfile) throw new Error('User not authenticated');
     
     console.log('🔍 Creating scraping job:', { jobType, inputUrl });
+    const supabase = createClerkSupabaseClient();
     
     const { data, error } = await supabase
       .from('scraping_jobs')
@@ -348,6 +258,7 @@ function App() {
     if (!userProfile) return;
     
     console.log('🔄 Updating scraping job:', { jobId, status, resultsCount });
+    const supabase = createClerkSupabaseClient();
     
     const updateData: any = {
       status,
@@ -369,6 +280,7 @@ function App() {
   const handleCancelJob = async (jobId: string) => {
     try {
       console.log('🛑 Cancelling job:', jobId);
+      const supabase = createClerkSupabaseClient();
       
       await supabase
         .from('scraping_jobs')
@@ -409,6 +321,7 @@ function App() {
     }
 
     // Get the selected API key
+    const supabase = createClerkSupabaseClient();
     const { data: keyData, error: keyError } = await supabase
       .from('apify_keys')
       .select('api_key')
@@ -571,6 +484,7 @@ function App() {
       return;
     }
 
+    const supabase = createClerkSupabaseClient();
     const { data: keyData, error: keyError } = await supabase
       .from('apify_keys')
       .select('api_key')
@@ -664,6 +578,7 @@ function App() {
       return;
     }
 
+    const supabase = createClerkSupabaseClient();
     const { data: keyData, error: keyError } = await supabase
       .from('apify_keys')
       .select('api_key')
@@ -702,6 +617,7 @@ function App() {
       return;
     }
 
+    const supabase = createClerkSupabaseClient();
     const { data: keyData, error: keyError } = await supabase
       .from('apify_keys')
       .select('api_key')
@@ -736,6 +652,7 @@ function App() {
     if (!userProfile) return;
     
     try {
+      const supabase = createClerkSupabaseClient();
       const { error } = await supabase
         .from('linkedin_profiles')
         .delete()
@@ -846,90 +763,10 @@ function App() {
     setCurrentView('user-profile');
   };
 
-  const handleAuthSuccess = () => {
-    // Auth state will be handled by the auth listener
-  };
-
   // Check if scraping is disabled (only disable if current user has a running job)
   const isScrapingDisabled = () => {
     return !selectedKeyId; // Only require API key, allow multiple jobs
   };
-
-  // Show error screen if there's a critical auth error
-  if (authError && !user) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-xl shadow-lg border border-gray-100 p-8 text-center">
-          <div className="p-3 bg-red-100 rounded-full w-16 h-16 mx-auto mb-6 flex items-center justify-center">
-            <AlertCircle className="w-8 h-8 text-red-600" />
-          </div>
-          
-          <h2 className="text-xl font-bold text-gray-900 mb-4">Connection Error</h2>
-          <p className="text-gray-600 mb-6">{authError}</p>
-          
-          <div className="space-y-3">
-            <button
-              onClick={() => window.location.reload()}
-              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-            >
-              Refresh Page
-            </button>
-            
-            <button
-              onClick={() => {
-                setAuthError('');
-                setIsLoading(true);
-                // Retry initialization
-                window.location.reload();
-              }}
-              className="w-full px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
-            >
-              Try Again
-            </button>
-          </div>
-          
-          <div className="mt-6 text-xs text-gray-500">
-            If this problem persists, please check your internet connection or contact support.
-          </div>
-          
-          {/* Additional troubleshooting info */}
-          <details className="mt-4 text-left">
-            <summary className="text-sm text-gray-600 cursor-pointer hover:text-gray-800">
-              Troubleshooting Steps
-            </summary>
-            <div className="mt-2 text-xs text-gray-600 space-y-2">
-              <p>1. Check your .env file contains valid Supabase credentials</p>
-              <p>2. Verify your Supabase project is active (not paused)</p>
-              <p>3. Ensure stable internet connection</p>
-              <p>4. Try disabling browser extensions or VPN</p>
-              <p>5. Check browser console for additional error details</p>
-            </div>
-          </details>
-        </div>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <div className="text-gray-600 text-lg font-medium">Loading Application...</div>
-          <div className="text-gray-500 text-sm mt-2">Connecting to services...</div>
-          {authError && (
-            <div className="mt-4 text-sm text-amber-600 max-w-md">
-              {authError}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (!user || !userProfile) {
-    return <Auth onAuthSuccess={handleAuthSuccess} />;
-  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -992,7 +829,7 @@ function App() {
                 </button>
               </nav>
               
-              <UserMenu user={user} onOpenProfile={handleOpenProfile} />
+              <ClerkUserMenu onOpenProfile={handleOpenProfile} />
             </div>
           </div>
         </div>
@@ -1173,6 +1010,34 @@ function App() {
         onCancelJob={handleCancelJob}
       />
     </div>
+  );
+}
+
+// Main App with Clerk Provider
+function App() {
+  const clerkPublishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+
+  if (!clerkPublishableKey) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-lg border border-gray-100 p-8 text-center">
+          <div className="p-3 bg-red-100 rounded-full w-16 h-16 mx-auto mb-6 flex items-center justify-center">
+            <AlertCircle className="w-8 h-8 text-red-600" />
+          </div>
+          
+          <h2 className="text-xl font-bold text-gray-900 mb-4">Configuration Error</h2>
+          <p className="text-gray-600 mb-6">
+            Missing Clerk configuration. Please check your environment variables.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <ClerkProvider publishableKey={clerkPublishableKey}>
+      <AppContent />
+    </ClerkProvider>
   );
 }
 
